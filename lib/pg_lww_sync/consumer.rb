@@ -315,8 +315,24 @@ module PgLwwSync
       SQL
       pruned = result.cmd_tuples
       Rails.logger.info "[PgLwwSync Consumer] Pruned #{pruned} delivered changesets older than #{PRUNE_RETAIN_DAYS} days." if pruned > 0
+
+      # Also prune column_timings table to keep metadata growth in check
+      prune_column_timings!
     rescue => e
       Rails.logger.warn "[PgLwwSync Consumer] Prune failed: #{e.message}"
+    end
+
+    def prune_column_timings!
+      conn = ActiveRecord::Base.connection
+      begin
+        interval = "#{PRUNE_RETAIN_DAYS} days"
+        # Call the database helper function; it returns the number of rows removed.
+        result = conn.select_value("SELECT pg_lww_sync.prune_column_timings(#{conn.quote(interval)}::interval);")
+        pruned = result.to_i
+        Rails.logger.info "[PgLwwSync Consumer] Pruned #{pruned} column_timings entries older than #{PRUNE_RETAIN_DAYS} days." if pruned > 0
+      rescue => e
+        Rails.logger.warn "[PgLwwSync Consumer] Column timings prune failed: #{e.message}"
+      end
     end
 
     def parse_processed_nodes(field)
