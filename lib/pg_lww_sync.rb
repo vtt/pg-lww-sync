@@ -67,6 +67,10 @@ module PgLwwSync
     # Attaches (or reattaches) the sync trigger to every non-system table.
     # Each table is handled in its own execute call so we never hold DDL locks
     # on multiple tables simultaneously — critical in production with many tables.
+    # Improvements:
+    # - Properly quote schema-qualified identifiers to avoid "schema.table" as a single identifier
+    # - Detect single-column primary keys and skip tables without a single-column PK
+    # - Skip partitioned tables and foreign tables (unsupported)
     def sync_all_tables!
       assert_valid_configuration!
 
@@ -88,12 +92,60 @@ module PgLwwSync
       SQL
 
       tables.each do |schema, table|
+        # Properly build a schema-qualified identifier using separate quoting
+        qualified_table = "#{conn.quote_table_name(schema)}.#{conn.quote_table_name(table)}"
+
+        # Skip partitioned tables
+        is_partitioned = conn.select_value(<<~SQL)
+          SELECT EXISTS(
+            SELECT 1 FROM pg_partitioned_table
+            WHERE partrelid = #{conn.quote("#{schema}.#{table}")}::regclass
+          )
+        SQL
+
+        if is_partitioned
+          Rails.logger.info "[PgLwwSync] Skipping partitioned table: #{schema}.#{table}"
+          next
+        end
+
+        # Skip foreign tables
+        is_foreign = conn.select_value(<<~SQL)
+          SELECT EXISTS(
+            SELECT 1 FROM pg_foreign_table ft
+            JOIN pg_class c ON ft.ftrelid = c.oid
+            WHERE c.oid = #{conn.quote("#{schema}.#{table}")}::regclass
+          )
+        SQL
+
+        if is_foreign
+          Rails.logger.info "[PgLwwSync] Skipping foreign table: #{schema}.#{table}"
+          next
+        end
+
+        # Determine primary key columns for the table. We only support a single
+        # primary key column for the trigger approach. Composite keys are skipped.
+        pk_cols = conn.select_values(<<~SQL)
+          SELECT a.attname
+          FROM pg_index i
+          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+          WHERE i.indrelid = #{conn.quote("#{schema}.#{table}")}::regclass
+            AND i.indisprimary
+          ORDER BY a.attnum;
+        SQL
+
+        if pk_cols.length != 1
+          Rails.logger.warn "[PgLwwSync] Skipping table without single PK: #{schema}.#{table} (pk_cols=#{pk_cols.inspect})"
+          next
+        end
+
+        pk_col = pk_cols.first
+
         # One execute per table = one lock taken and released per table, not all at once
         conn.execute(<<~SQL)
-          DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{conn.quote_table_name("#{schema}.#{table}")};
+          DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{qualified_table};
           CREATE TRIGGER c_pg_lww_sync_tg
-          BEFORE INSERT OR UPDATE OR DELETE ON #{conn.quote_table_name("#{schema}.#{table}")}
-          FOR EACH ROW EXECUTE PROCEDURE pg_lww_sync.log_lww_sync_changeset();
+          BEFORE INSERT OR UPDATE OR DELETE ON #{qualified_table}
+          FOR EACH ROW EXECUTE PROCEDURE pg_lww_sync.log_lww_sync_changeset(#{conn.quote(pk_col)});
         SQL
       end
     end
@@ -118,7 +170,8 @@ module PgLwwSync
           END;
           $node$ LANGUAGE plpgsql IMMUTABLE;
 
-          CREATE OR REPLACE FUNCTION pg_lww_sync.log_lww_sync_changeset()
+          -- Trigger function now accepts the primary key column name as an argument
+          CREATE OR REPLACE FUNCTION pg_lww_sync.log_lww_sync_changeset(p_pk_col TEXT)
           RETURNS TRIGGER AS $tg$
           DECLARE
             v_column_timestamps JSONB := '{}'::jsonb;
@@ -139,14 +192,19 @@ module PgLwwSync
               IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
             END IF;
 
-            v_record_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.id::text ELSE NEW.id::text END;
+            -- Fetch the record id using the provided primary key column name
+            IF TG_OP = 'DELETE' THEN
+              EXECUTE format('SELECT ($1).%I::text', p_pk_col) INTO v_record_id USING OLD;
+            ELSE
+              EXECUTE format('SELECT ($1).%I::text', p_pk_col) INTO v_record_id USING NEW;
+            END IF;
 
             IF TG_OP = 'INSERT' THEN
               -- Use pg_attribute for catalog access — much faster than information_schema
               FOR v_col IN
                 SELECT attname FROM pg_attribute
                 WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
-                  AND attnum > 0 AND NOT attisdropped AND attname != 'id'
+                  AND attnum > 0 AND NOT attisdropped AND attname != p_pk_col
                 ORDER BY attnum
               LOOP
                 v_column_timestamps := v_column_timestamps || jsonb_build_object(v_col, v_now);
@@ -156,7 +214,7 @@ module PgLwwSync
               FOR v_col IN
                 SELECT attname FROM pg_attribute
                 WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
-                  AND attnum > 0 AND NOT attisdropped AND attname != 'id'
+                  AND attnum > 0 AND NOT attisdropped AND attname != p_pk_col
                 ORDER BY attnum
               LOOP
                 EXECUTE format('SELECT ($1).%I::text', v_col) INTO v_old_val USING OLD;
@@ -337,9 +395,37 @@ module PgLwwSync
         $body$ LANGUAGE plpgsql;
       SQL
 
+      # Index to support pruning and queries by last_mutated_at
+      index_sql = <<~SQL
+        CREATE INDEX IF NOT EXISTS idx_pg_lww_sync_column_timings_last_mutated_at
+        ON pg_lww_sync.column_timings (last_mutated_at);
+      SQL
+
+      prune_function_sql = <<~SQL
+        CREATE OR REPLACE FUNCTION pg_lww_sync.prune_column_timings(p_retention INTERVAL)
+        RETURNS INTEGER AS $$
+        DECLARE
+          v_deleted INTEGER := 0;
+        BEGIN
+          -- Safe time-based pruning: remove entries older than retention window.
+          DELETE FROM pg_lww_sync.column_timings
+          WHERE last_mutated_at < (clock_timestamp() - p_retention)
+          RETURNING 1 INTO STRICT v_deleted;
+
+          -- Return number of rows removed. For large deletes consider batching.
+          GET DIAGNOSTICS v_deleted = ROW_COUNT;
+          RETURN v_deleted;
+        END;
+        $$ LANGUAGE plpgsql;
+      SQL
+
       ActiveRecord::Base.connection.execute(trigger_sql)
       ActiveRecord::Base.connection.execute("SELECT pg_lww_sync.log_lww_sync_init();")
       ActiveRecord::Base.connection.execute(lww_engine_sql)
+
+      # Create supporting index and pruning helper
+      ActiveRecord::Base.connection.execute(index_sql)
+      ActiveRecord::Base.connection.execute(prune_function_sql)
     end
 
     private
