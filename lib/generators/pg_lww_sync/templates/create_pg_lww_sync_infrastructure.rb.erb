@@ -1,0 +1,52 @@
+class CreatePgLwwSyncInfrastructure < ActiveRecord::Migration[6.1]
+  def change
+    execute "CREATE SCHEMA IF NOT EXISTS pg_lww_sync;"
+
+    # 1. Transactional outbox ledger
+    create_table "pg_lww_sync.pg_lww_changesets", id: :uuid, default: -> { "gen_random_uuid()" } do |t|
+      t.string   :table_schema,      null: false
+      t.string   :table_name,        null: false
+      t.string   :record_id,         null: false
+      t.string   :action_type,       null: false
+      t.jsonb    :changed_fields,    null: false
+      t.jsonb    :column_timestamps, null: false
+      t.bigint   :transaction_id,    null: false
+      t.string   :origin_node_id,    null: false
+      t.datetime :committed_at,      null: false
+
+      # Tracks per-peer delivery state, e.g. { "eu_west": "success" }
+      t.jsonb    :processed_nodes,   null: false, default: {}
+
+      # 'pending' until delivered to all peers; 'failed' if quarantined
+      t.string   :status,            null: false, default: 'pending'
+
+      t.timestamps
+    end
+
+    add_index "pg_lww_sync.pg_lww_changesets", [:status, :committed_at],
+              name: "idx_lww_changesets_polling"
+    add_index "pg_lww_sync.pg_lww_changesets", :transaction_id,
+              name: "idx_lww_changesets_tx_id"
+
+    # 2. Per-column LWW timestamp matrix
+    create_table "pg_lww_sync.column_timings", id: false do |t|
+      t.string   :table_schema,   null: false
+      t.string   :table_name,     null: false
+      t.string   :record_id,      null: false
+      t.string   :column_name,    null: false
+      -- '__deleted__' is a reserved column_name used to track deletion timestamps
+      t.datetime :last_mutated_at, null: false, limit: 6  # microsecond precision
+    end
+
+    # Unique constraint also acts as the upsert target
+    add_index "pg_lww_sync.column_timings",
+              [:table_schema, :table_name, :record_id, :column_name],
+              unique: true,
+              name: "idx_lww_column_timings_pk"
+
+    # Additional index to speed up the MAX(last_mutated_at) query in the DELETE LWW path
+    add_index "pg_lww_sync.column_timings",
+              [:table_schema, :table_name, :record_id],
+              name: "idx_lww_column_timings_record"
+  end
+end
