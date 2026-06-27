@@ -69,7 +69,7 @@ module PgLwwSync
     # on multiple tables simultaneously — critical in production with many tables.
     # Improvements:
     # - Properly quote schema-qualified identifiers to avoid "schema.table" as a single identifier
-    # - Detect single-column primary keys and skip tables without a single-column PK
+    # - Support both single and composite primary keys
     # - Skip partitioned tables and foreign tables (unsupported)
     def sync_all_tables!
       assert_valid_configuration!
@@ -122,8 +122,7 @@ module PgLwwSync
           next
         end
 
-        # Determine primary key columns for the table. We only support a single
-        # primary key column for the trigger approach. Composite keys are skipped.
+        # Determine primary key columns for the table. Support both single and composite keys.
         pk_cols = conn.select_values(<<~SQL)
           SELECT a.attname
           FROM pg_index i
@@ -133,19 +132,20 @@ module PgLwwSync
           ORDER BY a.attnum;
         SQL
 
-        if pk_cols.length != 1
-          Rails.logger.warn "[PgLwwSync] Skipping table without single PK: #{schema}.#{table} (pk_cols=#{pk_cols.inspect})"
+        if pk_cols.empty?
+          Rails.logger.warn "[PgLwwSync] Skipping table without primary key: #{schema}.#{table}"
           next
         end
 
-        pk_col = pk_cols.first
+        # Serialize PK column list as JSON for passing to trigger function
+        pk_cols_json = conn.quote(pk_cols.to_json)
 
         # One execute per table = one lock taken and released per table, not all at once
         conn.execute(<<~SQL)
           DROP TRIGGER IF EXISTS c_pg_lww_sync_tg ON #{qualified_table};
           CREATE TRIGGER c_pg_lww_sync_tg
           BEFORE INSERT OR UPDATE OR DELETE ON #{qualified_table}
-          FOR EACH ROW EXECUTE PROCEDURE pg_lww_sync.log_lww_sync_changeset(#{conn.quote(pk_col)});
+          FOR EACH ROW EXECUTE PROCEDURE pg_lww_sync.log_lww_sync_changeset(#{pk_cols_json});
         SQL
       end
     end
@@ -170,8 +170,8 @@ module PgLwwSync
           END;
           $node$ LANGUAGE plpgsql IMMUTABLE;
 
-          -- Trigger function now accepts the primary key column name as an argument
-          CREATE OR REPLACE FUNCTION pg_lww_sync.log_lww_sync_changeset(p_pk_col TEXT)
+          -- Trigger function now accepts primary key column names as a JSON array
+          CREATE OR REPLACE FUNCTION pg_lww_sync.log_lww_sync_changeset(p_pk_cols JSON)
           RETURNS TRIGGER AS $tg$
           DECLARE
             v_column_timestamps JSONB := '{}'::jsonb;
@@ -179,8 +179,9 @@ module PgLwwSync
             v_col TEXT;
             v_old_val TEXT;
             v_new_val TEXT;
-            v_record_id TEXT;
+            v_record_id JSONB;
             v_tx_id BIGINT := txid_current();
+            v_pk_col TEXT;
           BEGIN
             -- Skip when this session is applying replicated changes from a peer node,
             -- preventing the trigger from generating a new outbox entry (and thus
@@ -192,19 +193,28 @@ module PgLwwSync
               IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
             END IF;
 
-            -- Fetch the record id using the provided primary key column name
-            IF TG_OP = 'DELETE' THEN
-              EXECUTE format('SELECT ($1).%I::text', p_pk_col) INTO v_record_id USING OLD;
-            ELSE
-              EXECUTE format('SELECT ($1).%I::text', p_pk_col) INTO v_record_id USING NEW;
-            END IF;
+            -- Extract primary key values into a JSONB object for record identification
+            -- Supports both single and composite keys
+            v_record_id := '{}'::jsonb;
+            FOR v_pk_col IN
+              SELECT json_array_elements_text(p_pk_cols)
+            LOOP
+              IF TG_OP = 'DELETE' THEN
+                EXECUTE format('SELECT ($1).%I::text', v_pk_col) INTO v_old_val USING OLD;
+                v_record_id := v_record_id || jsonb_build_object(v_pk_col, v_old_val);
+              ELSE
+                EXECUTE format('SELECT ($1).%I::text', v_pk_col) INTO v_new_val USING NEW;
+                v_record_id := v_record_id || jsonb_build_object(v_pk_col, v_new_val);
+              END IF;
+            END LOOP;
 
             IF TG_OP = 'INSERT' THEN
               -- Use pg_attribute for catalog access — much faster than information_schema
               FOR v_col IN
                 SELECT attname FROM pg_attribute
                 WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
-                  AND attnum > 0 AND NOT attisdropped AND attname != p_pk_col
+                  AND attnum > 0 AND NOT attisdropped
+                  AND attname NOT IN (SELECT json_array_elements_text(p_pk_cols))
                 ORDER BY attnum
               LOOP
                 v_column_timestamps := v_column_timestamps || jsonb_build_object(v_col, v_now);
@@ -214,7 +224,8 @@ module PgLwwSync
               FOR v_col IN
                 SELECT attname FROM pg_attribute
                 WHERE attrelid = (quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(TG_TABLE_NAME))::regclass
-                  AND attnum > 0 AND NOT attisdropped AND attname != p_pk_col
+                  AND attnum > 0 AND NOT attisdropped
+                  AND attname NOT IN (SELECT json_array_elements_text(p_pk_cols))
                 ORDER BY attnum
               LOOP
                 EXECUTE format('SELECT ($1).%I::text', v_col) INTO v_old_val USING OLD;
@@ -234,7 +245,7 @@ module PgLwwSync
               changed_fields, column_timestamps, transaction_id,
               origin_node_id, committed_at, processed_nodes
             ) VALUES (
-              TG_TABLE_SCHEMA, TG_TABLE_NAME, v_record_id, TG_OP,
+              TG_TABLE_SCHEMA, TG_TABLE_NAME, v_record_id::text, TG_OP,
               CASE WHEN TG_OP = 'DELETE' THEN row_to_json(OLD) ELSE row_to_json(NEW) END,
               v_column_timestamps, v_tx_id, pg_lww_sync.local_node_id(),
               v_now, #{quoted_initial_nodes_json}::jsonb
@@ -262,13 +273,20 @@ module PgLwwSync
           v_incoming_time TIMESTAMP WITH TIME ZONE;
           v_local_time TIMESTAMP WITH TIME ZONE;
           v_update_sql TEXT := '';
-          v_insert_cols TEXT := 'id';
-          v_insert_vals TEXT := format('%L', p_record_id);
+          v_insert_cols TEXT := '';
+          v_insert_vals TEXT := '';
+          v_where_clause TEXT := '';
           v_exists BOOLEAN;
           v_local_deleted_at TIMESTAMP WITH TIME ZONE;
           v_incoming_deleted_at TIMESTAMP WITH TIME ZONE;
           v_temp_table_name TEXT;
+          v_record_id_jsonb JSONB;
+          v_pk_col TEXT;
+          v_pk_val TEXT;
         BEGIN
+          -- Parse composite record_id from JSON
+          v_record_id_jsonb := p_record_id::jsonb;
+
           -- ----------------------------------------------------------------
           -- DELETE path: LWW comparison against the most recent local write
           -- ----------------------------------------------------------------
@@ -283,7 +301,17 @@ module PgLwwSync
                OR v_incoming_deleted_at > v_local_time
                OR (v_incoming_deleted_at = v_local_time AND p_origin_node_id > pg_lww_sync.local_node_id())
             THEN
-              EXECUTE format('DELETE FROM %I.%I WHERE id = %L', p_table_schema, p_table_name, p_record_id);
+              -- Build WHERE clause from composite key
+              v_where_clause := '';
+              FOR v_pk_col, v_pk_val IN
+                SELECT key, value->>'_value'
+                FROM jsonb_each(v_record_id_jsonb)
+              LOOP
+                v_where_clause := v_where_clause || format(' AND %I = %L', v_pk_col, v_pk_val);
+              END LOOP;
+              v_where_clause := ltrim(v_where_clause, ' AND ');
+
+              EXECUTE format('DELETE FROM %I.%I WHERE %s', p_table_schema, p_table_name, v_where_clause);
 
               INSERT INTO pg_lww_sync.column_timings (table_schema, table_name, record_id, column_name, last_mutated_at)
               VALUES (p_table_schema, p_table_name, p_record_id, '__deleted__', v_incoming_deleted_at)
@@ -321,9 +349,19 @@ module PgLwwSync
           WHERE table_schema = p_table_schema AND table_name = p_table_name
             AND record_id = p_record_id AND column_name = '__deleted__';
 
+          -- Build WHERE clause from composite key for SELECT EXISTS check
+          v_where_clause := '';
+          FOR v_pk_col, v_pk_val IN
+            SELECT key, value->>'_value'
+            FROM jsonb_each(v_record_id_jsonb)
+          LOOP
+            v_where_clause := v_where_clause || format(' AND %I = %L', v_pk_col, v_pk_val);
+          END LOOP;
+          v_where_clause := ltrim(v_where_clause, ' AND ');
+
           EXECUTE format(
-            'SELECT EXISTS(SELECT 1 FROM %I.%I WHERE id = %L)',
-            p_table_schema, p_table_name, p_record_id
+            'SELECT EXISTS(SELECT 1 FROM %I.%I WHERE %s)',
+            p_table_schema, p_table_name, v_where_clause
           ) INTO v_exists;
 
           IF NOT v_exists THEN
@@ -331,7 +369,8 @@ module PgLwwSync
             FOR v_col IN
               SELECT attname FROM pg_attribute
               WHERE attrelid = (quote_ident(p_table_schema) || '.' || quote_ident(p_table_name))::regclass
-                AND attnum > 0 AND NOT attisdropped AND attname != 'id'
+                AND attnum > 0 AND NOT attisdropped
+                AND attname NOT IN (SELECT jsonb_object_keys(v_record_id_jsonb))
               ORDER BY attnum
             LOOP
               v_incoming_time := (p_column_timestamps->>v_col)::TIMESTAMP WITH TIME ZONE;
@@ -349,7 +388,18 @@ module PgLwwSync
               END IF;
             END LOOP;
 
-            IF v_insert_cols != 'id' THEN
+            -- Add PK columns to insert
+            FOR v_pk_col, v_pk_val IN
+              SELECT key, value->>'_value'
+              FROM jsonb_each(v_record_id_jsonb)
+            LOOP
+              v_insert_cols := v_insert_cols || format(', %I', v_pk_col);
+              v_insert_vals := v_insert_vals || format(', %L', v_pk_val);
+            END LOOP;
+
+            IF v_insert_cols != '' THEN
+              v_insert_cols := ltrim(v_insert_cols, ', ');
+              v_insert_vals := ltrim(v_insert_vals, ', ');
               EXECUTE format(
                 'INSERT INTO %I.%I (%s) VALUES (%s)',
                 p_table_schema, p_table_name, v_insert_cols, v_insert_vals
@@ -360,7 +410,8 @@ module PgLwwSync
             FOR v_col IN
               SELECT attname FROM pg_attribute
               WHERE attrelid = (quote_ident(p_table_schema) || '.' || quote_ident(p_table_name))::regclass
-                AND attnum > 0 AND NOT attisdropped AND attname != 'id'
+                AND attnum > 0 AND NOT attisdropped
+                AND attname NOT IN (SELECT jsonb_object_keys(v_record_id_jsonb))
               ORDER BY attnum
             LOOP
               v_incoming_time := (p_column_timestamps->>v_col)::TIMESTAMP WITH TIME ZONE;
@@ -388,7 +439,7 @@ module PgLwwSync
 
             IF v_update_sql != '' THEN
               v_update_sql := ltrim(v_update_sql, ', ');
-              EXECUTE format('UPDATE %I.%I SET %s WHERE id = %L', p_table_schema, p_table_name, v_update_sql, p_record_id);
+              EXECUTE format('UPDATE %I.%I SET %s WHERE %s', p_table_schema, p_table_name, v_update_sql, v_where_clause);
             END IF;
           END IF;
         END;
