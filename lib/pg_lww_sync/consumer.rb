@@ -293,13 +293,15 @@ module PgLwwSync
 
     def format_lww_sql_call(row, _target_node_id)
       conn = ActiveRecord::Base.connection
+      # record_id is stored as JSONB, pass directly
+      record_id = row['record_id'].is_a?(String) ? row['record_id'] : row['record_id'].to_json
       <<~SQL
         SELECT pg_lww_sync.apply_lww_change(
           #{conn.quote(row['table_schema'])},
           #{conn.quote(row['table_name'])},
-          #{conn.quote(row['record_id'])},
+          #{conn.quote(record_id)}::jsonb,
           #{conn.quote(row['action_type'])},
-          #{conn.quote(row['changed_fields'])},
+          #{conn.quote(row['changed_fields'])}::jsonb,
           #{conn.quote(row['column_timestamps'])}::jsonb,
           #{conn.quote(row['origin_node_id'])}
         );
