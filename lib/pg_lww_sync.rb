@@ -263,7 +263,7 @@ module PgLwwSync
           p_table_name TEXT,
           p_record_id JSONB,
           p_action_type TEXT,
-          p_changed_fields JSON,
+          p_changed_fields JSONB,
           p_column_timestamps JSONB,
           p_origin_node_id TEXT
         ) RETURNS VOID AS $body$
@@ -285,6 +285,11 @@ module PgLwwSync
           v_pk_col TEXT;
           v_all_pk_cols TEXT[];
         BEGIN
+          -- Validate record_id is not NULL
+          IF p_record_id IS NULL THEN
+            RAISE EXCEPTION 'record_id cannot be NULL for %.%', p_table_schema, p_table_name;
+          END IF;
+
           -- Get all PK column names from the table definition
           SELECT array_agg(a.attname ORDER BY a.attnum)
           INTO v_all_pk_cols
@@ -293,7 +298,18 @@ module PgLwwSync
           WHERE i.indrelid = (quote_ident(p_table_schema) || '.' || quote_ident(p_table_name))::regclass
             AND i.indisprimary;
 
-          -- Store JSONB as text for consistent lookups
+          -- Validate PK columns were found
+          IF v_all_pk_cols IS NULL OR array_length(v_all_pk_cols, 1) IS NULL OR array_length(v_all_pk_cols, 1) <= 0 THEN
+            RAISE EXCEPTION 'No primary key found for %.%', p_table_schema, p_table_name;
+          END IF;
+
+          -- Validate record_id array length matches PK column count
+          IF jsonb_array_length(p_record_id) != array_length(v_all_pk_cols, 1) THEN
+            RAISE EXCEPTION 'PK mismatch for %.%: record has % values but table expects %', 
+              p_table_schema, p_table_name, jsonb_array_length(p_record_id), array_length(v_all_pk_cols, 1);
+          END IF;
+
+          -- Store JSONB as text for consistent lookups in column_timings
           v_record_id_text := p_record_id::text;
 
           -- ----------------------------------------------------------------
@@ -316,6 +332,9 @@ module PgLwwSync
               LOOP
                 v_pk_col := v_all_pk_cols[v_pk_index];
                 v_pk_val := p_record_id->>(v_pk_index - 1);
+                IF v_pk_val IS NULL THEN
+                  RAISE EXCEPTION 'NULL value at index % for column %', v_pk_index - 1, v_pk_col;
+                END IF;
                 IF v_where_clause != '' THEN
                   v_where_clause := v_where_clause || ' AND ';
                 END IF;
@@ -347,7 +366,7 @@ module PgLwwSync
           );
           EXECUTE format('TRUNCATE TABLE %I', v_temp_table_name);
           EXECUTE format(
-            'INSERT INTO %I SELECT * FROM json_populate_record(NULL::%I.%I, $1)',
+            'INSERT INTO %I SELECT * FROM jsonb_populate_record(NULL::%I.%I, $1)',
             v_temp_table_name, p_table_schema, p_table_name
           ) USING p_changed_fields;
 
